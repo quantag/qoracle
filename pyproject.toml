@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qoracle"
+version = "0.1.0"
+description = "Compile C functions and AArch64 machine code into verified quantum oracle circuits"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "Sergii Salata, Quantag IT Solutions GmbH", email = "sergii.salata@quantag-it.com"}]
+requires-python = ">=3.10"
+dependencies = ["capstone>=5", "unicorn>=2", "lief>=0.14"]
+
+[project.optional-dependencies]
+qiskit = ["qiskit>=1.0"]
+
+[project.scripts]
+qoracle = "qoracle.__main__:main"
+
+[tool.setuptools]
+packages = ["qoracle"]

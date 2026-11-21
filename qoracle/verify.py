@@ -12,19 +12,23 @@ REGS = [getattr(U, f"UC_ARM64_REG_X{i}") for i in range(8)]
 class CPU:
     """Calls the function's machine code with given arguments (x0..x7) and returns x0."""
 
-    def __init__(self, code, base):
+    def __init__(self, image):
+        """image: frontend.Image (code and data at their linked addresses)."""
         self.mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
-        size = (len(code) + base + 0xFFF) & ~0xFFF
-        self.mu.mem_map(CODE, max(size, 0x1000))
+        size = (len(image.section) + 0xFFF) & ~0xFFF
+        self.mu.mem_map(image.section_addr, max(size, 0x1000))
+        self.mu.mem_write(image.section_addr, image.section)
+        for addr, data, _ in image.data:
+            self.mu.mem_map(addr, (max(len(data), 1) + 0xFFF) & ~0xFFF)
+            self.mu.mem_write(addr, data)
         self.mu.mem_map(RET, 0x1000)
-        self.mu.mem_write(CODE + base, code)
-        self.entry = CODE + base
+        self.entry = image.entry
 
     def back_edges(self, args, edges, max_insns=10_000_000):
         """How many times the code jumps along one of `edges` ((from-instruction, to) addresses) in one call."""
         from unicorn import UC_HOOK_CODE
         seen = {"prev": None, "n": 0}
-        e = {(CODE + a, CODE + b) for a, b in edges}
+        e = set(edges)
 
         def hook(uc, address, size, _):
             if (seen["prev"], address) in e:

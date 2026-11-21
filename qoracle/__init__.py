@@ -17,7 +17,7 @@ from .circuit import Circuit
 from . import frontend, symexec, verify
 from .a64 import Unsupported
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 MASK64 = (1 << 64) - 1
 
 
@@ -80,8 +80,9 @@ def build(source, function, args, out_bits=32, mode="compute", loop_bound="auto"
             obj, cmd = frontend.compile_c(source, opt, cc)
         else:
             obj, cmd = source, None
-        code, base = frontend.extract(obj, function)
-        fn = symexec.Function(code, base, function)
+        image = frontend.load(obj, function)
+        memory = [(image.section_addr, image.section)] + [(a, d) for a, d, _ in image.data]
+        fn = symexec.Function(image.code, image.entry, function, memory)
     except (frontend.FrontendError, Unsupported) as e:
         raise OracleError(str(e))
     finally:
@@ -93,7 +94,7 @@ def build(source, function, args, out_bits=32, mode="compute", loop_bound="auto"
     elif loop_bound == "auto":
         spec = [(a.name, a.bits, a.signed) for a in args if a.name]
         vectors, exhaustive = verify.test_inputs(spec, verify_limit)
-        cpu = verify.CPU(code, base)
+        cpu = verify.CPU(image)
         edges = [(fn.blocks[u][-1].addr, v) for u, v, _ in fn.back]
         try:
             loop_bound = max(cpu.back_edges(cpu_args(args, vec), edges) for vec in vectors)
@@ -113,7 +114,7 @@ def build(source, function, args, out_bits=32, mode="compute", loop_bound="auto"
             w = g.const(a.value & MASK64, 64)
         words.append(w)
     try:
-        x0, unfinished, copies = symexec.run(fn, g, words, loop_bound)
+        x0, unfinished, copies, ex = symexec.run(fn, g, words, loop_bound)
     except Unsupported as e:
         raise OracleError(str(e))
     outs = x0[:out_bits]
@@ -129,13 +130,13 @@ def build(source, function, args, out_bits=32, mode="compute", loop_bound="auto"
     circ = Circuit(g, inputs, outs, mode)
     rep = circ.report()
     rep.update(function=function, instructions=len(fn.insns), blocks=len(fn.blocks), loops=len(fn.back),
-               loop_bound=loop_bound, loop_bound_source=bound_note or ("given" if fn.has_loops else None), block_copies=copies, xag_nodes=len(g.kind), output_bits=len(outs), constant_top_bits_dropped=dropped,
+               loop_bound=loop_bound, loop_bound_source=bound_note or ("given" if fn.has_loops else None), block_copies=copies, tables=[n for _, _, n in image.data], rom_bits=ex.rom_bits, xag_nodes=len(g.kind), output_bits=len(outs), constant_top_bits_dropped=dropped,
                compiler=cmd, build_seconds=round(t1 - t0, 2))
     listing = [repr(i) for i in fn.insns]
     o = Oracle(function, circ, rep, args, len(outs), False, listing)
     o.requested_bits = out_bits
     if check:
-        rep["verification"] = check_oracle(o, g, inputs, outs, unfinished, code, base, verify_limit)
+        rep["verification"] = check_oracle(o, g, inputs, outs, unfinished, ex.oob, image, verify_limit)
     return o
 
 
@@ -152,15 +153,19 @@ def cpu_args(args, vec):
     return regs
 
 
-def check_oracle(o, g, inputs, outs, unfinished, code, base, limit):
+def check_oracle(o, g, inputs, outs, unfinished, oob, image, limit):
     """Simulate the compute-mode circuit on many inputs and compare with the CPU emulator."""
     spec = [(a.name, a.bits, a.signed) for a in o.args if a.name]
     vectors, exhaustive = verify.test_inputs(spec, limit)
-    vc = Circuit(g, inputs, outs, "compute", extra=[unfinished])
+    vc = Circuit(g, inputs, outs, "compute", extra=[unfinished, oob])
     lanes = len(vectors)
     q = vc.simulate(lanes, {name: [v[name] for v in vectors] for name, _, _ in spec})
     got = Circuit.lane_values(q, vc.out0, vc.n_out, lanes)
     unf = Circuit.lane_values(q, vc.extra0, 1, lanes)
+    out_of_range = Circuit.lane_values(q, vc.extra0 + 1, 1, lanes)
+    if any(out_of_range):
+        j = out_of_range.index(1)
+        raise OracleError(f"table index out of range for input {vectors[j]}: the function reads outside its data")
     if any(unf):
         j = unf.index(1)
         raise OracleError(f"the loop bound is too small: input {vectors[j]} needs more iterations")
@@ -170,7 +175,7 @@ def check_oracle(o, g, inputs, outs, unfinished, code, base, limit):
     for name, first, size in vc.regs:
         if name in inputs and Circuit.lane_values(q, first, size, lanes) != [v[name] for v in vectors]:
             raise OracleError(f"internal error: input {name} was changed")
-    cpu = verify.CPU(code, base)
+    cpu = verify.CPU(image)
     mask = (1 << o.requested_bits) - 1          # the full width: dropped top bits must be 0 on the CPU too
     for j, vec in enumerate(vectors):
         try:

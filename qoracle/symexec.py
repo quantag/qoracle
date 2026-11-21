@@ -17,7 +17,8 @@ from . import a64
 class Function:
     """A decoded function: instructions, basic blocks, and its back edges."""
 
-    def __init__(self, code, base, name):
+    def __init__(self, code, base, name, memory=()):
+        self.memory = list(memory)
         self.name, self.base, self.end = name, base, base + len(code)
         self.insns = a64.decode(code, base)
         for i in self.insns:
@@ -76,8 +77,8 @@ class Function:
 
 def run(fn, g, args, bound=0, max_nodes=2_000_000):
     """Execute fn on all paths. args: list of 64-literal words for x0, x1, ... Returns (x0 word at return,
-    unfinished literal, number of block copies executed)."""
-    ex = a64.Exec(g)
+    unfinished literal, number of block copies executed, the executor: ex.oob, ex.rom_bits)."""
+    ex = a64.Exec(g, fn.memory)
     init = a64.State([list(args[i]) if i < len(args) else [FALSE] * 64 for i in range(31)], (FALSE,) * 4)
     pending = {(fn.base, 0): [(TRUE, init)]}   # (block, copy) -> incoming (predicate, state)
     out = [FALSE] * 64
@@ -91,6 +92,7 @@ def run(fn, g, args, bound=0, max_nodes=2_000_000):
             active, st = merge(g, inc)
             if active == FALSE:
                 continue
+            ex.active = active
             body = fn.blocks[b]
             for ins in body[:-1] if body[-1].is_branch else body:
                 ex.step(ins, st)
@@ -118,7 +120,7 @@ def run(fn, g, args, bound=0, max_nodes=2_000_000):
                 pending.setdefault(key, []).append((p, st))
             if len(g.kind) > max_nodes:
                 raise a64.Unsupported(f"the logic network grew beyond {max_nodes} nodes (loop bound {bound})")
-    return out, unfinished, copies
+    return out, unfinished, copies, ex
 
 
 def merge(g, inc):

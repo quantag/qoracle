@@ -54,7 +54,10 @@ def main(argv=None):
     if a.asm:
         for line in o.listing:
             print("                 " + line)
-    print(f"  logic network  {r['and_nodes']} AND, {r['xor_nodes']} XOR")
+    if r.get("rom_bits"):
+        print(f"  tables         {', '.join(r['tables'])}: quantum ROM, {r['rom_bits']} table bits read with a superposed index")
+    print(f"  logic network  {r['and_nodes']} AND, {r['xor_nodes']} XOR"
+          + (f" ({r['xor_folded']} more folded into them)" if r.get("xor_folded") else ""))
     print(f"  circuit        {r['qubits']} qubits ({r['inputs']} in, {r['outputs']} out, {r['ancillas']} work), "
           f"{r['gates']} gates: {r['toffoli']} Toffoli, {r['cnot']} CNOT, {r['x'] + r['z']} single-qubit; depth {r['depth']}")
     print(f"  T count        {r['t_count']} (7 per Toffoli)")

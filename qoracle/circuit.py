@@ -40,6 +40,18 @@ class Circuit:
             need.add(n)
             if g.kind[n] in ("and", "xor"):
                 stack += [g.a[n] >> 1, g.b[n] >> 1]
+        # XOR folding: an XOR node used only once, by another XOR node, gets no qubit of its own; the
+        # XOR node above it CNOTs the folded node's operands straight into its own qubit. A quantum ROM's
+        # value bit (the XOR of many decoder lines) then costs one qubit instead of one per XOR.
+        uses = {}
+        for n in need:
+            if g.kind[n] in ("and", "xor"):
+                for c in (g.a[n] >> 1, g.b[n] >> 1):
+                    uses.setdefault(c, []).append(n)
+        pinned = {l >> 1 for l in list(outputs) + list(extra)}
+        folded = {n for n in need if g.kind[n] == "xor" and n not in pinned and len(uses.get(n, ())) == 1
+                  and g.kind[uses[n][0]] == "xor"}
+        self.n_folded = len(folded)
         self.q = {}                                   # XAG node -> qubit
         self.regs = []                                # (name, first qubit, size)
         nq = 0
@@ -63,6 +75,8 @@ class Circuit:
         self.n_and = self.n_xor = 0
         for n in sorted(need):                        # node ids are a topological order
             k = g.kind[n]
+            if n in folded:
+                continue
             if k == "in":
                 if n not in self.q:
                     raise ValueError(f"input bit {g.name[n]} is not part of the circuit's inputs")
@@ -74,7 +88,16 @@ class Circuit:
                 compute += self._ccx(g.a[n], g.b[n], t)
             else:
                 self.n_xor += 1
-                compute += [("cx", self.q[g.a[n] >> 1], t), ("cx", self.q[g.b[n] >> 1], t)]
+                leaves, flip, stack = {}, 0, [g.a[n], g.b[n]]
+                while stack:                          # the parity of the folded XOR tree below n
+                    l = stack.pop()
+                    flip ^= l & 1
+                    c = l >> 1
+                    if c in folded:
+                        stack += [g.a[c], g.b[c]]
+                    elif c:
+                        leaves[c] = leaves.get(c, 0) ^ 1
+                compute += [("cx", self.q[c], t) for c, odd in leaves.items() if odd] + [("x", t)] * flip
         self.n_anc = nq - self.anc0
         self.nqubits = nq
         middle = []
@@ -132,7 +155,7 @@ class Circuit:
         c = self.counts()
         tof = c.get("ccx", 0)
         return dict(qubits=self.nqubits, inputs=self.n_in, outputs=self.n_out, ancillas=self.n_anc,
-                    and_nodes=self.n_and, xor_nodes=self.n_xor, gates=sum(c.values()), toffoli=tof,
+                    and_nodes=self.n_and, xor_nodes=self.n_xor, xor_folded=self.n_folded, gates=sum(c.values()), toffoli=tof,
                     cnot=c.get("cx", 0), x=c.get("x", 0), z=c.get("z", 0), t_count=7 * tof, depth=self.depth())
 
     # ------------------------------------------------------------------ bit-parallel simulation

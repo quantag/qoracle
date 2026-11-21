@@ -4,12 +4,12 @@
 
   1. Word operations of the logic network, exhaustively on small widths.
   2. Hand-written functions (arithmetic, division by constants and variables, shifts, comparisons,
-     branches, loops, bit tricks), at -O0..-O3 where the code stays register-only: every oracle is
+     branches, loops, bit tricks, lookup tables and switch tables), at -O0..-O3 where the code stays register-only: every oracle is
      simulated on every input and compared with the machine code in the CPU emulator; work qubits
      must return to 0 and inputs must be unchanged.
   3. Random functions: random expressions with every C integer operator, conditionals and loops.
-  4. Errors are reported: memory access, calls, a loop bound that is too small, phase mode with a
-     multi-bit result.
+  4. Errors are reported: an index outside a table, writing memory, calls, a loop bound that is too
+     small, phase mode with a multi-bit result.
   5. Phase oracles: Grover search with the is_root oracle finds the four square roots of 9 mod 16.
 Run: python3 -m tests.test_oracles [random functions]"""
 import os, random, sys, tempfile, textwrap
@@ -43,6 +43,16 @@ int clz32(unsigned x) { return x ? __builtin_clz(x) : 32; }
 int parity(unsigned x) { return __builtin_parity(x); }
 int sign(int x) { return (x > 0) - (x < 0); }
 int fib(int n) { int a = 0, b = 1; for (int i = 0; i < n; i++) { int t = a + b; a = b; b = t; } return a; }
+static const unsigned char SB[16] = {0xC, 5, 6, 0xB, 9, 0, 0xA, 0xD, 3, 0xE, 0xF, 8, 4, 7, 1, 2};
+unsigned sbox2(unsigned x) { return SB[x & 15] | SB[(x >> 4) & 15] << 4; }
+static const short ST[8] = {-5, 3, -100, 7, 0, 1000, -1, 2};
+long short_tab(unsigned x, long y) { return ST[x & 7] * y; }
+static const unsigned SQ[8] = {0, 1, 4, 9, 16, 25, 36, 49};
+unsigned sq_loop(unsigned x) { unsigned s = 0; while (x) { s += SQ[x & 7]; x >>= 3; } return s; }
+int swtab(int x) { switch (x) { case 0: return 11; case 1: return 22; case 2: return 37; case 3: return 41;
+                                case 4: return 59; case 5: return 63; default: return -1; } }
+static const unsigned long BIG[4] = {0x0123456789abcdefUL, 0xfedcba9876543210UL, 42, 7};
+unsigned long big_tab(unsigned x) { return BIG[x & 3] >> (x >> 2); }
 """
 
 # (function, inputs, extra constant arguments placed by position: None = an input)
@@ -53,6 +63,7 @@ CASES = [
     ("is_prime", ["n:8"]), ("rotl", ["x:8", "k:5"]), ("clamp", ["x:6s", "-5", "20"]), ("absdiff", ["a:6s", "b:6s"]),
     ("bitrev8", ["x:8"]), ("majority", ["a:4", "b:4", "c:4"]), ("mulhi", ["a:12", "b:4"]), ("clz32", ["x:12"]),
     ("parity", ["x:12"]), ("sign", ["x:8s"]), ("fib", ["n:4"]),
+    ("sbox2", ["x:8"]), ("short_tab", ["x:3", "y:4s"]), ("sq_loop", ["x:9"]), ("swtab", ["x:4s"]), ("big_tab", ["x:6"]),
 ]
 
 
@@ -97,7 +108,7 @@ def compile_cases(d):
                 o = build(src, name, args, opt=opt)
             except OracleError as e:
                 msg = str(e)
-                if opt == "0" and ("memory access" in msg or "stack pointer" in msg):
+                if opt == "0" and "stack" in msg:
                     stats["skipped"].append(f"{name} -O0 (stack)")
                     continue
                 raise AssertionError(f"{name} -O{opt}: {msg}")
@@ -143,12 +154,8 @@ def random_functions(d, n, seed=11):
     open(src, "w").write("\n".join(lines) + "\n")
     count = tables = 0
     for name, args in cases:
-        try:
-            o = build(src, name, args, opt=r.choice(["1", "2"]))
-        except OracleError as e:
-            assert "constant table" in str(e), (name, str(e))
-            tables += 1
-            continue
+        o = build(src, name, args, opt=r.choice(["1", "2"]))
+        tables += bool(o.report["rom_bits"])
         assert o.report["verification"]["exhaustive"]
         count += 1
     return count, tables
@@ -157,24 +164,29 @@ def random_functions(d, n, seed=11):
 def errors(d):
     src = os.path.join(d, "bad.c")
     open(src, "w").write(textwrap.dedent("""\
-        int table[16];
+        static const unsigned char t4[4] = {3, 1, 4, 1};
         int g(int);
-        int lookup(int x) { return table[x & 15]; }
+        int lookup(unsigned x) { return t4[x]; }
+        int counter;
+        int store(int x) { counter = x; return x; }
         int calls(int x) { return g(x) + 1; }
         int twice(int x) { return 2 * x; }
         int loop(int x) { int s = 0; while (x) { s = s * 3 + (x & 1); x >>= 1; } return s; }
         """))
-    for fn, args, kw, msg in (("lookup", ["x:4"], {}, "refers to 'table'"), ("calls", ["x:4"], {}, "refers to 'g'"),
+    for fn, args, kw, msg in (("lookup", ["x:2"], {}, None), ("lookup", ["x:12"], {}, "table index out of range"),
+                              ("store", ["x:4"], {}, "memory write"), ("calls", ["x:4"], {}, "refers to 'g'"),
                               ("twice", ["x:4"], {"mode": "phase"}, "1-bit result"),
                               ("loop", ["x:6"], {"loop_bound": 2}, "loop bound is too small"),
                               ("nothere", ["x:4"], {}, "no function 'nothere'")):
         try:
             build(src, fn, args, **kw)
+            if msg is None:
+                continue
         except OracleError as e:
             assert msg in str(e), (fn, str(e))
         else:
             raise AssertionError(f"{fn}: no error")
-    return 5
+    return 7
 
 
 def grover():
@@ -194,7 +206,7 @@ def main():
         print(f"2) {s['oracles']} oracles from {len(CASES)} functions at -O0/-O1/-O2/-O3/-Os: every one equal to the "
               f"AArch64 CPU on all {s['inputs']} inputs; work qubits clean; ({len(s['skipped'])} -O0 cases use the stack: skipped)")
         ok, tables = random_functions(d, n_rand)
-        print(f"3) {ok} random functions: equal to the CPU on all inputs ({tables} skipped: the compiler made a lookup table)")
+        print(f"3) {ok} random functions: equal to the CPU on all inputs ({tables} of them with lookup tables the compiler made)")
         print(f"4) {errors(d)} error cases reported correctly")
     rep, p = grover()
     print(f"5) Grover with the is_root phase oracle ({rep['qubits']} qubits, {rep['toffoli']} Toffoli): "

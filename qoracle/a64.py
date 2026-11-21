@@ -5,13 +5,16 @@
 The state is the 31 general registers (64 bits each, as lists of XAG literals) and the NZCV flags.
 Each instruction's effect is written down exactly as the architecture defines it, on symbolic bits;
 the XAG folds constants and shares equal subexpressions as it goes. Integer instructions only:
-memory access, calls, floating point and system instructions are rejected with a clear message.
+Loads read the data the function refers to (constant tables, globals as initialised); with a
+symbolic address a load is a quantum ROM (see Exec.load). Stores, the stack, calls, floating point and
+system instructions are rejected with a clear message.
 """
 import capstone
 from capstone import arm64 as A
 from .xag import FALSE, TRUE
 
-R, I = A.ARM64_OP_REG, A.ARM64_OP_IMM
+R, I, MEM = A.ARM64_OP_REG, A.ARM64_OP_IMM, A.ARM64_OP_MEM
+LOADS = {"ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrsw", "ldur", "ldurb", "ldurh", "ldursb", "ldursh", "ldursw"}
 SHIFT = {A.ARM64_SFT_LSL: "lsl", A.ARM64_SFT_LSR: "lsr", A.ARM64_SFT_ASR: "asr", A.ARM64_SFT_ROR: "ror"}
 EXT = {A.ARM64_EXT_UXTB: (8, False), A.ARM64_EXT_UXTH: (16, False), A.ARM64_EXT_UXTW: (32, False), A.ARM64_EXT_UXTX: (64, False),
        A.ARM64_EXT_SXTB: (8, True), A.ARM64_EXT_SXTH: (16, True), A.ARM64_EXT_SXTW: (32, True), A.ARM64_EXT_SXTX: (64, True)}
@@ -44,6 +47,7 @@ class Insn:
         self.addr, self.size = ci.address, ci.size
         self.mnemonic, self.op_str = ci.mnemonic, ci.op_str
         self.ops = list(ci.operands)
+        self.writeback = getattr(ci, "writeback", False)
         self.cc = CC.get(ci.cc)
         self.reg_name = ci.reg_name
         m = self.mnemonic
@@ -64,12 +68,19 @@ def check(ins):
     m = ins.mnemonic
     if m in REJECT:
         raise Unsupported(f"{REJECT[m]} {ins.where()}")
-    if m.startswith(("ld", "st", "prfm")):
-        raise Unsupported(f"a memory access {ins.where()} (use -O1 or higher, and no arrays or pointers yet)")
+    if m.startswith(("st", "prfm")) or (m.startswith("ld") and m not in LOADS):
+        raise Unsupported(f"a memory write or an unsupported load {ins.where()} (functions may read tables, not write memory)")
+    if m in LOADS:
+        mem = [o for o in ins.ops if o.type == MEM]
+        literal = len(ins.ops) == 2 and ins.ops[1].type == I         # ldr x0, label (a literal pool)
+        if len(ins.ops) != 2 or (len(mem) != 1 and not literal) or ins.writeback:
+            raise Unsupported(f"a load with write-back or an unusual form {ins.where()}")
+        if mem and mem[0].mem.base and ins.reg_name(mem[0].mem.base) in ("sp", "wsp"):
+            raise Unsupported(f"the stack {ins.where()} (the function keeps values in memory; try -O1 or higher)")
     for o in ins.ops:
         if o.type == R and ins.reg_name(o.reg) in ("sp", "wsp"):
             raise Unsupported(f"the stack pointer {ins.where()} (the function uses memory; try -O1 or higher)")
-        if o.type not in (R, I) and not ins.is_branch:
+        if o.type not in (R, I) and not ins.is_branch and m not in LOADS:
             raise Unsupported(f"an operand of type {o.type} {ins.where()}")
 
 
@@ -88,8 +99,74 @@ def decode(code, base=0):
 class Exec:
     """Symbolic execution of one instruction at a time."""
 
-    def __init__(self, g):
+    def __init__(self, g, memory=()):
+        """memory: [(address, bytes)] the function may read."""
         self.g = g
+        self.memory = [(a, bytes(d)) for a, d in memory]
+        self.active = TRUE              # the activity predicate of the block being executed (set by symexec)
+        self.oob = FALSE                # some active load read outside the known data
+        self.rom_bits = 0               # table bits read with a symbolic address (for the report)
+
+    # ------------------------------------------------------------------ memory
+    def load(self, addr, nbytes):
+        """Read nbytes (little endian) at the symbolic 64-bit address addr.
+
+        A quantum ROM: for every address the load could read (inside the known data, agreeing with the
+        address bits that are constant), a decoder line eq = (addr == that address), built as an AND
+        chain from the top variable bit down, so that lines share their prefixes. Lines are mutually
+        exclusive, so each result bit is the XOR of the lines whose data has that bit set: CNOTs only.
+        An active load matching no line reads outside the data: flagged in self.oob."""
+        g = self.g
+        const_mask = const_val = 0
+        var = []
+        for i, b in enumerate(addr):
+            if b in (FALSE, TRUE):
+                const_mask |= 1 << i
+                const_val |= b << i
+            else:
+                var.append(i)
+        cands = [(a + off, d[off:off + nbytes]) for a, d in self.memory for off in range(0, len(d) - nbytes + 1)
+                 if ((a + off) & const_mask) == const_val]
+        if not var:
+            hit = [v for a, v in cands if a == const_val]
+            if not hit:
+                self.oob = g.OR(self.oob, self.active)
+                return [FALSE] * (8 * nbytes)
+            v = int.from_bytes(hit[0], "little")
+            return g.const(v, 8 * nbytes)
+        var.sort(reverse=True)
+        bits = [FALSE] * (8 * nbytes)
+        lines = []
+        for a, v in cands:
+            eq = TRUE
+            for i in var:
+                eq = g.AND(eq, addr[i] if (a >> i) & 1 else addr[i] ^ 1)
+            lines.append(eq)
+            val = int.from_bytes(v, "little")
+            for k in range(8 * nbytes):
+                if (val >> k) & 1:
+                    bits[k] = g.XOR(bits[k], eq)
+        self.rom_bits += 8 * nbytes * len(cands)
+        inside = g.XOR_all(lines)
+        self.oob = g.OR(self.oob, g.AND(self.active, inside ^ 1))
+        return bits
+
+    def address(self, ins, st, o):
+        """The address of a memory operand [base, index (extended, shifted), #disp], as a 64-bit word."""
+        g, m = self.g, o.mem
+        a = self.reg(st, ins.reg_name(m.base).replace("w", "x", 1)) if m.base else g.const(0, 64)
+        if m.index:
+            idx = self.reg(st, ins.reg_name(m.index))
+            if o.ext:
+                bits, signed = EXT[o.ext]
+                idx = idx[:bits] + [idx[:bits][-1] if signed else FALSE] * (64 - bits)
+            idx = (idx + [FALSE] * 64)[:64]
+            if o.shift.type == A.ARM64_SFT_LSL:
+                idx = g.shift_const(idx, o.shift.value, "lsl")
+            a = g.add(a, idx)[0]
+        if m.disp:
+            a = g.add(a, g.const(m.disp & ((1 << 64) - 1), 64))[0]
+        return a
 
     # ------------------------------------------------------------------ operands
     def reg(self, st, name):
@@ -160,11 +237,21 @@ class Exec:
         rn = lambda k: ins.reg_name(ops[k].reg)
         if m in REJECT:
             raise Unsupported(f"{REJECT[m]} {ins.where()}")
-        if m.startswith(("ld", "st", "prfm")):
-            raise Unsupported(f"a memory access {ins.where()} (use -O1 or higher, and no arrays or pointers yet)")
+        if m.startswith(("st", "prfm")) or (m.startswith("ld") and m not in LOADS):
+            raise Unsupported(f"a memory write or an unsupported load {ins.where()}")
         if m in ("nop", "hint", "bti", "paciasp", "autiasp"):
             return
         w = self.width(ins) if ops and ops[0].type == R else 64
+
+        if m in ("adrp", "adr"):
+            self.write(st, rn(0), g.const(ops[1].imm & ((1 << 64) - 1), 64)); return
+        if m in LOADS:
+            size = {"b": 1, "h": 2}.get(m[-1], 4 if m.endswith("sw") else w // 8)
+            signed = m.startswith(("ldrs", "ldurs"))
+            a = (g.const(ops[1].imm & ((1 << 64) - 1), 64) if ops[1].type == I
+                 else self.address(ins, st, ops[1]))
+            v = self.load(a, size)
+            self.write(st, rn(0), (v + [v[-1] if signed else FALSE] * w)[:w]); return
 
         if m == "mov":
             self.write(st, rn(0), self.val(ins, st, 1, w)); return

@@ -129,6 +129,7 @@ values.
 ```bash
 python3 -m tests.test_oracles          # word operations; 28 functions at -O0..-O3/-Os; random functions; errors; Grover
 python3 examples/aes_grover.py         # Grover search through the AES S-box
+python3 examples/shor.py               # Shor: factor 15 and 21 with the modexp oracle (simulated)
 python3 experiments/vs_interpreter.py  # the comparison above
 ```
 

@@ -77,3 +77,25 @@ def grover(circuit, name, iterations=None):
         v = (s >> first) & ((1 << size) - 1)
         probs[v] = probs.get(v, 0) + abs(a) ** 2
     return probs
+
+
+def period_finding(circuit, name):
+    """The quantum part of Shor's algorithm with a compute oracle |x>|0> -> |x>|f(x)>: register `name`
+    in uniform superposition, the oracle, then the quantum Fourier transform on `name`.
+    Returns {measured value of `name`: probability}."""
+    if circuit.mode != "compute":
+        raise ValueError("period finding needs a compute oracle (mode='compute')")
+    first, size = register(circuit, name)
+    N = 1 << size
+    st = apply(uniform(circuit, name), circuit.gates)
+    mask = (N - 1) << first
+    groups = {}
+    for s, a in st.items():
+        groups.setdefault(s & ~mask, {})[(s & mask) >> first] = a
+    probs = {}
+    for amps in groups.values():                       # QFT on the register, for each value of f(x)
+        for k in range(N):
+            a = sum(v * complex(math.cos(2 * math.pi * x * k / N), math.sin(2 * math.pi * x * k / N))
+                    for x, v in amps.items()) / math.sqrt(N)
+            probs[k] = probs.get(k, 0) + abs(a) ** 2
+    return probs

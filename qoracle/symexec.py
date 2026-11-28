@@ -11,18 +11,21 @@ edges. A path that still wants to loop after `bound` back edges sets the `unfini
 verification requires to be false for every tested input.
 """
 from .xag import FALSE, TRUE
-from . import a64
+from . import a64, x64
+
+ARCHES = {"aarch64": a64, "x86_64": x64}
 
 
 class Function:
     """A decoded function: instructions, basic blocks, and its back edges."""
 
-    def __init__(self, code, base, name, memory=()):
+    def __init__(self, code, base, name, memory=(), arch="aarch64"):
         self.memory = list(memory)
+        self.arch = ARCHES[arch]
         self.name, self.base, self.end = name, base, base + len(code)
-        self.insns = a64.decode(code, base)
+        self.insns = self.arch.decode(code, base)
         for i in self.insns:
-            a64.check(i)
+            self.arch.check(i)
         self.at = {i.addr: k for k, i in enumerate(self.insns)}
         leaders = {base}
         for k, i in enumerate(self.insns):
@@ -43,9 +46,9 @@ class Function:
         for s, body in self.blocks.items():
             last = body[-1]
             nxt = last.addr + last.size
-            if last.mnemonic == "ret":
+            if last.is_ret:
                 self.succ[s] = []
-            elif last.mnemonic == "b":
+            elif last.uncond:
                 self.succ[s] = [(last.targets[0], "taken")]
             elif last.is_branch:
                 self.succ[s] = [(last.targets[0], "taken"), (nxt, "fall")]
@@ -78,8 +81,12 @@ class Function:
 def run(fn, g, args, bound=0, max_nodes=2_000_000):
     """Execute fn on all paths. args: list of 64-literal words for x0, x1, ... Returns (x0 word at return,
     unfinished literal, number of block copies executed, the executor: ex.oob, ex.rom_bits)."""
-    ex = a64.Exec(g, fn.memory)
-    init = a64.State([list(args[i]) if i < len(args) else [FALSE] * 64 for i in range(31)], (FALSE,) * 4)
+    arch = fn.arch
+    ex = arch.Exec(g, fn.memory)
+    regs = [[FALSE] * 64 for _ in range(arch.NREGS)]
+    for k, w in enumerate(args):
+        regs[arch.ARGS[k]] = list(w)
+    init = arch.State(regs, (FALSE,) * arch.NFLAGS)
     pending = {(fn.base, 0): [(TRUE, init)]}   # (block, copy) -> incoming (predicate, state)
     out = [FALSE] * 64
     done, unfinished, copies = FALSE, FALSE, 0
@@ -100,7 +107,7 @@ def run(fn, g, args, bound=0, max_nodes=2_000_000):
             if last.is_branch:
                 t = ex.branch(last, st)
                 if t == "ret":
-                    out = [g.XOR(o, g.AND(active, x)) for o, x in zip(out, st.x[0])]
+                    out = [g.XOR(o, g.AND(active, x)) for o, x in zip(out, st.x[arch.RET_REG])]
                     done = g.XOR(done, active)
                     continue
                 preds = {"taken": g.AND(active, t), "fall": g.AND(active, t ^ 1)}
@@ -131,7 +138,7 @@ def merge(g, inc):
     active = g.XOR_all(p for p, _ in inc)
     states = [s for _, s in inc]
     x = []
-    for r in range(31):
+    for r in range(len(states[0].x)):
         words = [s.x[r] for s in states]
         if all(wd is words[0] or wd == words[0] for wd in words[1:]):
             x.append(words[0])
@@ -140,4 +147,4 @@ def merge(g, inc):
                   g.XOR_all(g.AND(p, l) for (p, _), l in zip(inc, lits)) for lits in zip(*words)])
     nz = tuple(f[0] if all(v == f[0] for v in f) else g.XOR_all(g.AND(p, v) for (p, _), v in zip(inc, f))
                for f in zip(*(s.nzcv for s in states)))
-    return active, a64.State(x, nz)
+    return active, type(states[0])(x, nz)

@@ -1,6 +1,6 @@
 # qoracle: quantum oracles from ordinary code
 
-qoracle turns a classical function, written in C or given as compiled AArch64 machine code, into a
+qoracle turns a classical function, written in C or given as compiled AArch64 or x86-64 machine code, into a
 reversible circuit for a quantum computer: a *quantum oracle*. Every circuit is checked against the
 real machine code running on a CPU emulator before it is written out.
 
@@ -26,7 +26,8 @@ because it is compared with the processor.
 
 ## Quick start
 
-Needs Python 3.10+, clang with the AArch64 target (`clang --target=aarch64-linux-gnu`), and the Python
+Needs Python 3.10+, clang with the AArch64 target (`clang --target=aarch64-linux-gnu`; for `--arch x86_64`,
+the x86-64 target), and the Python
 packages in `pyproject.toml` (capstone, unicorn, lief; qiskit only for `to_qiskit()`).
 
 ```bash
@@ -98,8 +99,14 @@ function should be.
 
 ## What is supported
 
-- **Input**: integer C functions, or AArch64 ELF object files. Up to 8 arguments, each a quantum input
-  of 1 to 64 bits or a constant.
+- **Input**: integer C functions, or AArch64 or x86-64 ELF object files (`--arch x86_64` compiles C for
+  x86-64). Up to 8 arguments on AArch64 and 6 on x86-64 (System V: RDI, RSI, RDX, RCX, R8, R9), each a
+  quantum input of 1 to 64 bits or a constant.
+- **x86-64**: MOV and its extensions, LEA, ADD/SUB/ADC/SBB/CMP/NEG/INC/DEC, the logic instructions,
+  IMUL and MUL (with the high half in RDX), DIV and IDIV, shifts and rotates (also BMI2's SHLX/SHRX/
+  SARX/RORX), SETcc and CMOVcc on every condition including parity, Jcc/JMP/RET, CDQ/CQO/CDQE, BSWAP,
+  POPCNT, LZCNT, TZCNT, BSR/BSF, BT, XCHG; RIP-relative tables. The test suite builds the same 28
+  functions and 60 random ones at -O1 to -Os for both architectures, each verified on every input.
 - **Instructions**: add / subtract with flags, logic, multiply (also 64-bit products and high halves),
   unsigned and signed divide, shifts and rotates by constants or registers, bit-field and extend
   instructions, bit and byte reversal, count leading zeros, conditional select / set / compare,
@@ -112,7 +119,7 @@ function should be.
   a resource report.
 
 Not yet: writing memory (arrays the function changes, pointers, the stack at `-O0`), calls between
-functions, floating point, x86-64 and RISC-V code. Global variables are read with their initial
+functions, floating point, RISC-V code; on x86-64, jump tables (`jmp [table + rax*8]`). Global variables are read with their initial
 values.
 
 ## Roadmap

@@ -28,14 +28,21 @@ class Image:
     section: bytes              # the whole code section, relocated (the CPU emulator maps it)
     section_addr: int
     data: list = field(default_factory=list)      # [(address, bytes, section name)]
+    arch: str = "aarch64"                         # or "x86_64"
 
 
-def compile_c(src, opt="1", cc="clang", extra=()):
+TARGETS = {"aarch64": "aarch64-linux-gnu", "x86_64": "x86_64-linux-gnu"}
+
+
+def compile_c(src, opt="1", cc="clang", extra=(), arch="aarch64"):
     if not shutil.which(cc):
-        raise FrontendError(f"{cc} not found (clang with the AArch64 target is needed)")
+        raise FrontendError(f"{cc} not found (clang with the {arch} target is needed)")
     fd, out = tempfile.mkstemp(suffix=".o", prefix="qoracle_")
     os.close(fd)
-    cmd = [cc] + CFLAGS + [f"-O{opt}", "-c", src, "-o", out] + list(extra)
+    flags = [f"--target={TARGETS[arch]}"] + CFLAGS[1:]
+    if arch == "x86_64":                       # integer code only: no SSE for small copies or vectorized loops
+        flags += ["-mno-sse", "-mno-red-zone", "-fomit-frame-pointer", "-fcf-protection=none"]
+    cmd = [cc] + flags + [f"-O{opt}", "-c", src, "-o", out] + list(extra)
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode:
         raise FrontendError("compiling failed:\n" + " ".join(cmd) + "\n" + p.stderr)
@@ -58,8 +65,10 @@ def load(obj, name):
     b = lief.parse(obj)
     if b is None or not isinstance(b, lief.ELF.Binary):
         raise FrontendError(f"{obj} is not an ELF object file")
-    if b.header.machine_type != lief.ELF.ARCH.AARCH64:
-        raise FrontendError(f"{obj} is not AArch64 code (other architectures come later)")
+    machine = b.header.machine_type
+    if machine not in (lief.ELF.ARCH.AARCH64, lief.ELF.ARCH.X86_64):
+        raise FrontendError(f"{obj} is neither AArch64 nor x86-64 code")
+    arch = "aarch64" if machine == lief.ELF.ARCH.AARCH64 else "x86_64"
     syms = [s for s in b.symbols if s.name == name and s.type == lief.ELF.Symbol.TYPE.FUNC]
     if not syms:
         funcs = sorted(s.name for s in b.symbols if s.type == lief.ELF.Symbol.TYPE.FUNC and s.name)
@@ -100,6 +109,18 @@ def load(obj, name):
         P = CODE + r.address
         off = r.address
         t = r.type
+        if arch == "x86_64":
+            if t in (R.X86_64_PC32, R.X86_64_PLT32) and s.type != lief.ELF.Symbol.TYPE.FUNC:
+                struct.pack_into("<i", code, off, X - P)
+            elif t == R.X86_64_32S:
+                struct.pack_into("<i", code, off, X)
+            elif t == R.X86_64_32:
+                struct.pack_into("<I", code, off, X)
+            elif t == R.X86_64_64:
+                struct.pack_into("<Q", code, off, X)
+            else:
+                raise FrontendError(f"'{name}': relocation {t} is not supported yet")
+            continue
         if t == R.AARCH64_ADR_PREL_PG_HI21:
             _patch(code, off, ((X & ~0xFFF) - (P & ~0xFFF)) >> 12, [(29, 2), (5, 19)])
         elif t == R.AARCH64_ADR_PREL_LO21:
@@ -116,4 +137,4 @@ def load(obj, name):
         else:
             raise FrontendError(f"'{name}': relocation {t} is not supported yet")
     code = bytes(code)
-    return Image(code=code[lo:hi], entry=CODE + lo, section=code, section_addr=CODE, data=data)
+    return Image(code=code[lo:hi], entry=CODE + lo, section=code, section_addr=CODE, data=data, arch=arch)

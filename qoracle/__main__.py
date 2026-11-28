@@ -26,6 +26,8 @@ def main(argv=None):
     ap.add_argument("--out-bits", type=int, default=32, help="bits of the result to output (default 32; constant top bits are dropped)")
     ap.add_argument("--loop-bound", default="auto", help="most jumps back over all loops on any path, or auto: measured on the CPU (default)")
     ap.add_argument("-O", dest="opt", default="1", help="clang optimization level (default 1)")
+    ap.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64",
+                    help="the target when compiling C (an object file says its own; default aarch64)")
     ap.add_argument("--cc", default="clang", help="C compiler (clang with the AArch64 target; default clang)")
     ap.add_argument("-o", "--output", help="write the circuit as OpenQASM 3 to this file")
     ap.add_argument("--verify", type=int, default=4096, help="test inputs when not all can be tested (default 4096)")
@@ -34,7 +36,7 @@ def main(argv=None):
     ap.add_argument("--version", action="version", version=f"qoracle {__version__}")
     a = ap.parse_args(argv)
     try:
-        o = build(a.source, a.function, a.args, out_bits=a.out_bits, mode=a.mode, loop_bound=a.loop_bound,
+        o = build(a.source, a.function, a.args, out_bits=a.out_bits, mode=a.mode, loop_bound=a.loop_bound, arch=a.arch,
                   opt=a.opt, cc=a.cc, verify_limit=a.verify)
     except OracleError as e:
         print(f"qoracle: {e}", file=sys.stderr)
@@ -49,7 +51,7 @@ def main(argv=None):
     sig = ", ".join(f"{x.name}: {x.bits} bits{' signed' if x.signed else ''}" if x.name else str(x.value) for x in o.args)
     v = r["verification"]
     print(f"{a.function}({sig})  {a.mode} oracle, {r['output_bits']}-bit result")
-    print(f"  machine code   AArch64, {r['instructions']} instructions, {r['blocks']} block{'s' if r['blocks'] > 1 else ''}"
+    print(f"  machine code   {r.get('arch', 'AArch64')}, {r['instructions']} instructions, {r['blocks']} block{'s' if r['blocks'] > 1 else ''}"
           + (f", loops unrolled to {r['loop_bound']} repetitions ({r['loop_bound_source']})" if r["loops"] else ""))
     if a.asm:
         for line in o.listing:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Quantag IT Solutions GmbH
-"""qoracle against the AArch64 CPU.
+"""qoracle against the AArch64 CPU, and against the x86-64 CPU (parts 2-4 again with --arch x86_64).
 
   1. Word operations of the logic network, exhaustively on small widths.
   2. Hand-written functions (arithmetic, division by constants and variables, shifts, comparisons,
@@ -98,18 +98,21 @@ def word_ops():
     return n
 
 
-def compile_cases(d):
+def compile_cases(d, arch="aarch64"):
     src = os.path.join(d, "funcs.c")
     open(src, "w").write(FUNCTIONS)
     stats = dict(oracles=0, inputs=0, skipped=[])
     for opt in ("0", "1", "2", "3", "s"):
         for name, args in CASES:
             try:
-                o = build(src, name, args, opt=opt)
+                o = build(src, name, args, opt=opt, arch=arch)
             except OracleError as e:
                 msg = str(e)
                 if opt == "0" and "stack" in msg:
                     stats["skipped"].append(f"{name} -O0 (stack)")
+                    continue
+                if arch == "x86_64" and "jump table" in msg:
+                    stats["skipped"].append(f"{name} -O{opt} (a jump table)")
                     continue
                 raise AssertionError(f"{name} -O{opt}: {msg}")
             v = o.report["verification"]
@@ -138,7 +141,7 @@ def rand_expr(r, vars_, depth):
     return f"(({a}) {op} ({b}))"
 
 
-def random_functions(d, n, seed=11):
+def random_functions(d, n, seed=11, arch="aarch64"):
     r = random.Random(seed)
     lines, cases = [], []
     for k in range(n):
@@ -154,14 +157,14 @@ def random_functions(d, n, seed=11):
     open(src, "w").write("\n".join(lines) + "\n")
     count = tables = 0
     for name, args in cases:
-        o = build(src, name, args, opt=r.choice(["1", "2"]))
+        o = build(src, name, args, opt=r.choice(["1", "2"]), arch=arch)
         tables += bool(o.report["rom_bits"])
         assert o.report["verification"]["exhaustive"]
         count += 1
     return count, tables
 
 
-def errors(d):
+def errors(d, arch="aarch64"):
     src = os.path.join(d, "bad.c")
     open(src, "w").write(textwrap.dedent("""\
         static const unsigned char t4[4] = {3, 1, 4, 1};
@@ -179,7 +182,7 @@ def errors(d):
                               ("loop", ["x:6"], {"loop_bound": 2}, "loop bound is too small"),
                               ("nothere", ["x:4"], {}, "no function 'nothere'")):
         try:
-            build(src, fn, args, **kw)
+            build(src, fn, args, arch=arch, **kw)
             if msg is None:
                 continue
         except OracleError as e:
@@ -208,6 +211,12 @@ def main():
         ok, tables = random_functions(d, n_rand)
         print(f"3) {ok} random functions: equal to the CPU on all inputs ({tables} of them with lookup tables the compiler made)")
         print(f"4) {errors(d)} error cases reported correctly")
+        s = compile_cases(d, "x86_64")
+        print(f"2x) x86-64: {s['oracles']} oracles from {len(CASES)} functions at -O0..-Os: every one equal to the x86-64 "
+              f"CPU on all {s['inputs']} inputs; skipped: {', '.join(s['skipped']) or 'none'}")
+        ok, tables = random_functions(d, n_rand, arch="x86_64")
+        print(f"3x) x86-64: {ok} random functions equal to the CPU on all inputs ({tables} with lookup tables)")
+        print(f"4x) x86-64: {errors(d, 'x86_64')} error cases reported correctly")
     rep, p = grover()
     print(f"5) Grover with the is_root phase oracle ({rep['qubits']} qubits, {rep['toffoli']} Toffoli): "
           f"P(x in {{3, 5, 11, 13}}) = {p:.6f} after 1 iteration")

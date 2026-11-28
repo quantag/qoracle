@@ -27,6 +27,9 @@ REJECT = {"bl": "a function call", "blr": "a call through a register", "br": "a 
           "svc": "a system call", "brk": "a breakpoint", "hlt": "a halt"}
 
 
+ARGS, RET_REG, NREGS, NFLAGS = list(range(8)), 0, 31, 4     # x0..x7 in, x0 out; NZCV
+
+
 class Unsupported(Exception):
     pass
 
@@ -52,6 +55,7 @@ class Insn:
         self.reg_name = ci.reg_name
         m = self.mnemonic
         self.is_branch = m in BRANCHES or m.startswith("b.")
+        self.is_ret, self.uncond = m == "ret", m == "b"
         self.targets = [o.imm for o in self.ops if o.type == I] if self.is_branch and m != "ret" else []
         if m in ("tbz", "tbnz"):
             self.targets = [self.ops[2].imm]

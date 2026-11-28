@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Quantag IT Solutions GmbH
-"""Verification: the oracle circuit against the real machine code, run on an AArch64 CPU emulator."""
-import random
-from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UcError
-from unicorn import arm64_const as U
+"""Verification: the oracle circuit against the real machine code, run on a CPU emulator (AArch64 or x86-64)."""
+import random, struct
+from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UC_ARCH_X86, UC_MODE_64, UcError
+from unicorn import arm64_const as U, x86_const as XC
 
 CODE, RET = 0x100000, 0x200000
 REGS = [getattr(U, f"UC_ARM64_REG_X{i}") for i in range(8)]
+X86_ARGS = [XC.UC_X86_REG_RDI, XC.UC_X86_REG_RSI, XC.UC_X86_REG_RDX, XC.UC_X86_REG_RCX, XC.UC_X86_REG_R8,
+            XC.UC_X86_REG_R9]
+STACK = 0x300000                                  # x86-64: the return address is on the stack
 
 
 class CPU:
@@ -14,7 +17,8 @@ class CPU:
 
     def __init__(self, image):
         """image: frontend.Image (code and data at their linked addresses)."""
-        self.mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+        self.x86 = getattr(image, "arch", "aarch64") == "x86_64"
+        self.mu = Uc(UC_ARCH_X86, UC_MODE_64) if self.x86 else Uc(UC_ARCH_ARM64, UC_MODE_ARM)
         size = (len(image.section) + 0xFFF) & ~0xFFF
         self.mu.mem_map(image.section_addr, max(size, 0x1000))
         self.mu.mem_write(image.section_addr, image.section)
@@ -22,6 +26,9 @@ class CPU:
             self.mu.mem_map(addr, (max(len(data), 1) + 0xFFF) & ~0xFFF)
             self.mu.mem_write(addr, data)
         self.mu.mem_map(RET, 0x1000)
+        if self.x86:
+            self.mu.mem_map(STACK, 0x10000)
+            self.mu.mem_write(RET, b"\xf4")             # hlt, never reached: emulation stops at RET
         self.entry = image.entry
 
     def back_edges(self, args, edges, max_insns=10_000_000):
@@ -43,6 +50,21 @@ class CPU:
 
     def call(self, args, max_insns=10_000_000):
         mu = self.mu
+        if self.x86:
+            for r in (XC.UC_X86_REG_RAX, XC.UC_X86_REG_RBX, XC.UC_X86_REG_R10, XC.UC_X86_REG_R11):
+                mu.reg_write(r, 0)
+            for r, v in zip(X86_ARGS, list(args) + [0] * 6):
+                mu.reg_write(r, v & (2 ** 64 - 1))
+            sp = STACK + 0x8000
+            mu.mem_write(sp, struct.pack("<Q", RET))
+            mu.reg_write(XC.UC_X86_REG_RSP, sp)
+            try:
+                mu.emu_start(self.entry, RET, count=max_insns)
+            except UcError as e:
+                raise RuntimeError(f"the CPU emulator stopped: {e}")
+            if mu.reg_read(XC.UC_X86_REG_RIP) != RET:
+                raise RuntimeError(f"the function did not return within {max_insns} instructions")
+            return mu.reg_read(XC.UC_X86_REG_RAX)
         for r, v in zip(REGS, list(args) + [0] * 8):
             mu.reg_write(r, v & (2 ** 64 - 1))
         mu.reg_write(U.UC_ARM64_REG_X30, RET)

@@ -62,14 +62,15 @@ class Oracle:
 
 
 def build(source, function, args, out_bits=32, mode="compute", loop_bound="auto", opt="1", cc="clang",
-          verify_limit=4096, keep_constant_outputs=False, check=True):
-    """Compile `function` from a C file or AArch64 object file into an oracle circuit, and verify it.
+          verify_limit=4096, keep_constant_outputs=False, check=True, arch="aarch64"):
+    """Compile `function` from a C file or an AArch64 or x86-64 object file into an oracle circuit, and verify it.
+    arch: the target when compiling C (aarch64 or x86_64); an object file says its own.
     loop_bound: the most jumps back (loop repetitions, all loops together) on any path; "auto" measures it
     by running the machine code on the test inputs (exact when the inputs are tested exhaustively)."""
     t0 = time.time()
     args = [a if isinstance(a, Arg) else Arg.parse(a) for a in args]
-    if len(args) > 8:
-        raise OracleError("at most 8 arguments (x0..x7)")
+    if len(args) > 8 or (arch == "x86_64" and len(args) > 6):
+        raise OracleError("at most 8 arguments (x0..x7) on AArch64, 6 (RDI..R9) on x86-64")
     names = [a.name for a in args if a.name]
     if len(set(names)) != len(names):
         raise OracleError("input names must be different")
@@ -77,12 +78,12 @@ def build(source, function, args, out_bits=32, mode="compute", loop_bound="auto"
         raise OracleError("give at least one quantum input, for example x:4")
     try:
         if source.endswith(".c"):
-            obj, cmd = frontend.compile_c(source, opt, cc)
+            obj, cmd = frontend.compile_c(source, opt, cc, arch=arch)
         else:
             obj, cmd = source, None
         image = frontend.load(obj, function)
         memory = [(image.section_addr, image.section)] + [(a, d) for a, d, _ in image.data]
-        fn = symexec.Function(image.code, image.entry, function, memory)
+        fn = symexec.Function(image.code, image.entry, function, memory, getattr(image, "arch", "aarch64"))
     except (frontend.FrontendError, Unsupported) as e:
         raise OracleError(str(e))
     finally:
@@ -129,7 +130,7 @@ def build(source, function, args, out_bits=32, mode="compute", loop_bound="auto"
     t1 = time.time()
     circ = Circuit(g, inputs, outs, mode)
     rep = circ.report()
-    rep.update(function=function, instructions=len(fn.insns), blocks=len(fn.blocks), loops=len(fn.back),
+    rep.update(arch="x86-64" if getattr(image, "arch", "aarch64") == "x86_64" else "AArch64", function=function, instructions=len(fn.insns), blocks=len(fn.blocks), loops=len(fn.back),
                loop_bound=loop_bound, loop_bound_source=bound_note or ("given" if fn.has_loops else None), block_copies=copies, tables=[n for _, _, n in image.data], rom_bits=ex.rom_bits, xag_nodes=len(g.kind), output_bits=len(outs), constant_top_bits_dropped=dropped,
                compiler=cmd, build_seconds=round(t1 - t0, 2))
     listing = [repr(i) for i in fn.insns]
@@ -184,5 +185,6 @@ def check_oracle(o, g, inputs, outs, unfinished, oob, image, limit):
             raise OracleError(f"input {vec}: {e}")
         if got[j] != want:
             raise OracleError(f"MISMATCH for input {vec}: circuit {got[j]}, CPU {want}")
-    return dict(inputs_tested=lanes, exhaustive=exhaustive, against="AArch64 CPU emulator (Unicorn)",
+    against = "x86-64" if getattr(image, "arch", "aarch64") == "x86_64" else "AArch64"
+    return dict(inputs_tested=lanes, exhaustive=exhaustive, against=f"{against} CPU emulator (Unicorn)",
                 work_qubits_clean=True, inputs_unchanged=True)
